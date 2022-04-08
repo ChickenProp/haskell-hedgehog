@@ -30,6 +30,8 @@ import           Control.Concurrent.STM (TVar, atomically)
 import qualified Control.Concurrent.STM.TVar as TVar
 import           Control.Monad.Catch (MonadCatch(..), catchAll)
 import           Control.Monad.IO.Class (MonadIO(..))
+import           Data.Maybe (isJust)
+import           System.Environment (lookupEnv)
 
 import           Hedgehog.Internal.Config
 import           Hedgehog.Internal.Gen (evalGenT)
@@ -45,6 +47,7 @@ import           Hedgehog.Internal.Property (TestCount(..), PropertyCount(..))
 import           Hedgehog.Internal.Property (confidenceSuccess, confidenceFailure)
 import           Hedgehog.Internal.Property (coverageSuccess, journalCoverage)
 import           Hedgehog.Internal.Property (defaultMinTests)
+import           Hedgehog.Internal.Property (ShrinkPath(..), shrinkPathDecompress)
 import           Hedgehog.Internal.Queue
 import           Hedgehog.Internal.Region
 import           Hedgehog.Internal.Report
@@ -119,12 +122,13 @@ takeSmallest ::
   => Size
   -> Seed
   -> ShrinkCount
+  -> ShrinkPath
   -> ShrinkLimit
   -> ShrinkRetries
   -> (Progress -> m ())
   -> NodeT m (Maybe (Either Failure (), Journal))
   -> m Result
-takeSmallest size seed shrinks slimit retries updateUI = \case
+takeSmallest size seed shrinks shrinkPath slimit retries updateUI = \case
   NodeT Nothing _ ->
     pure GaveUp
 
@@ -133,7 +137,7 @@ takeSmallest size seed shrinks slimit retries updateUI = \case
       Left (Failure loc err mdiff) -> do
         let
           failure =
-            mkFailure size seed shrinks Nothing loc err mdiff (reverse logs)
+            mkFailure size seed shrinks shrinkPath Nothing loc err mdiff (reverse logs)
 
         updateUI $ Shrinking failure
 
@@ -141,15 +145,60 @@ takeSmallest size seed shrinks slimit retries updateUI = \case
           -- if we've hit the shrink limit, don't shrink any further
           pure $ Failed failure
         else
-          findM xs (Failed failure) $ \m -> do
+          findM (zip [0..] xs) (Failed failure) $ \(n, m) -> do
             o <- runTreeN retries m
             if isFailure o then
-              Just <$> takeSmallest size seed (shrinks + 1) slimit retries updateUI o
+              let ShrinkPath oldPath = shrinkPath
+                  newPath = ShrinkPath (n:oldPath)
+              in Just <$> takeSmallest size seed (shrinks + 1) newPath slimit retries updateUI o
             else
               return Nothing
 
       Right () ->
         return OK
+
+-- | Follow a given shrink path, instead of searching exhaustively. Assume that
+-- the end of the path is minimal, and don't try to shrink any further than
+-- that.
+--
+-- This evaluates the test for all the shrinks on the path, but not ones
+-- off-path. Because the generator is mixed with the test code, it's probably
+-- not possible to avoid this.
+skipToShrink ::
+     MonadIO m
+  => Size
+  -> Seed
+  -> ShrinkPath
+  -> (Progress -> m ())
+  -> NodeT m (Maybe (Either Failure (), Journal))
+  -> m Result
+skipToShrink size seed (ShrinkPath shrinkPath) updateUI =
+  go 0 (reverse shrinkPath)
+ where
+  go shrinks [] = \case
+    NodeT Nothing _ ->
+      pure GaveUp
+
+    NodeT (Just (x, (Journal logs))) _ ->
+      case x of
+        Left (Failure loc err mdiff) -> do
+          let
+            failure =
+              mkFailure size seed shrinks (ShrinkPath shrinkPath) Nothing loc err mdiff (reverse logs)
+
+          updateUI $ Shrinking failure
+          pure $ Failed failure
+
+        Right () ->
+          return OK
+
+  go shrinks (s0:ss) = \case
+    NodeT _ xs ->
+      case drop s0 xs of
+        [] -> pure GaveUp
+        (x:_) -> do
+          o <- runTreeT x
+          go (shrinks + 1) ss o
 
 checkReport ::
      forall m.
@@ -161,7 +210,22 @@ checkReport ::
   -> PropertyT m ()
   -> (Report Progress -> m ())
   -> m (Report Result)
-checkReport cfg size0 seed0 test0 updateUI =
+checkReport cfg size0 seed0 test0 updateUI = do
+  -- These should be parameters (or rather, combined as one parameter), but that
+  -- would need changes in hspec-hedgehog.
+  mSkipToTest1 <-
+    liftIO $ fmap (TestCount . read) <$> lookupEnv "HEDGEHOG_SKIP_TO_TEST"
+
+  mSkipToShrink1 <- liftIO $
+    fmap shrinkPathDecompress <$> lookupEnv "HEDGEHOG_SKIP_TO_SHRINK"
+
+  let (mSkipToTest, mSkipToShrink) = case (mSkipToTest1, mSkipToShrink1) of
+        (Nothing, Nothing) -> (Nothing, Nothing)
+        (Just t, Nothing) -> (Just t, Nothing)
+        (Nothing, Just (Just (t, s))) -> (Just t, Just s)
+        (Nothing, Just Nothing) -> error "could not read shrink path"
+        (Just _, Just _) -> error "Cannot skip to both test and shrink"
+
   let
     test =
       catchAll test0 (fail . show)
@@ -228,6 +292,7 @@ checkReport cfg size0 seed0 test0 updateUI =
             size
             seed
             0
+            (ShrinkPath [])
             (Just coverage0)
             Nothing
             message
@@ -235,7 +300,8 @@ checkReport cfg size0 seed0 test0 updateUI =
             []
 
         confidenceReport =
-          if coverageReached && labelsCovered then
+          -- Disable coverage checks if we skip tests.
+          if isJust mSkipToTest || (coverageReached && labelsCovered) then
             successReport
           else
             failureReport $
@@ -266,36 +332,49 @@ checkReport cfg size0 seed0 test0 updateUI =
 
       else
         case Seed.split seed of
-          (s0, s1) -> do
-            node@(NodeT x _) <-
-              runTreeT . evalGenT size s0 . runTestT $ unPropertyT test
-            case x of
-              Nothing ->
-                loop tests (discards + 1) (size + 1) s1 coverage0
+          (s0, s1) -> case (mSkipToTest, mSkipToShrink) of
+            -- If the report says failed "after 32 tests", the test number that
+            -- failed was 31, but we want the user to be able to skip to 32 and
+            -- start with the one that failed.
+            (Just n, _) | n > tests + 1 ->
+              loop (tests + 1) discards (size + 1) s1 coverage0
+            (Just _, Just shrinkPath) -> do
+              node <-
+                runTreeT . evalGenT size s0 . runTestT $ unPropertyT test
+              let mkReport = Report (tests + 1) discards coverage0
+              mkReport
+               <$> skipToShrink size s0 shrinkPath (updateUI . mkReport) node
+            _ -> do
+              node@(NodeT x _) <-
+                runTreeT . evalGenT size s0 . runTestT $ unPropertyT test
+              case x of
+                Nothing ->
+                  loop tests (discards + 1) (size + 1) s1 coverage0
 
-              Just (Left _, _) ->
-                let
-                  mkReport =
-                    Report (tests + 1) discards coverage0
-                in
-                  fmap mkReport $
-                    takeSmallest
-                      size
-                      seed
-                      0
-                      (propertyShrinkLimit cfg)
-                      (propertyShrinkRetries cfg)
-                      (updateUI . mkReport)
-                      node
+                Just (Left _, _) ->
+                  let
+                    mkReport =
+                      Report (tests + 1) discards coverage0
+                  in
+                    fmap mkReport $
+                      takeSmallest
+                        size
+                        seed
+                        0
+                        (ShrinkPath [])
+                        (propertyShrinkLimit cfg)
+                        (propertyShrinkRetries cfg)
+                        (updateUI . mkReport)
+                        node
 
-              Just (Right (), journal) ->
-                let
-                  coverage =
-                    journalCoverage journal <> coverage0
-                in
-                  loop (tests + 1) discards (size + 1) s1 coverage
-  in
-    loop 0 0 size0 seed0 mempty
+                Just (Right (), journal) ->
+                  let
+                    coverage =
+                      journalCoverage journal <> coverage0
+                  in
+                    loop (tests + 1) discards (size + 1) s1 coverage
+
+  loop 0 0 size0 seed0 mempty
 
 checkRegion ::
      MonadIO m
