@@ -82,6 +82,7 @@ prop_mkInput =
     -- logs.
     seed <- Config.resolveSeed Nothing
     void $ liftIO $ Runner.checkReport (Property.propertyConfig prop)
+                                       undefined
                                        seed
                                        (Property.propertyTest prop)
                                        (const $ pure ())

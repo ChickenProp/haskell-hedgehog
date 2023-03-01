@@ -206,11 +206,12 @@ checkReport ::
      MonadIO m
   => MonadCatch m
   => PropertyConfig
+  -> Size -- ^ ignored, but retained for backwards compatibility
   -> Seed
   -> PropertyT m ()
   -> (Report Progress -> m ())
   -> m (Report Result)
-checkReport cfg seed0 test0 updateUI = do
+checkReport cfg _ seed0 test0 updateUI = do
   skip <- liftIO $ resolveSkip $ propertySkip cfg
 
   let
@@ -432,13 +433,14 @@ checkRegion ::
   => Region
   -> UseColor
   -> Maybe PropertyName
+  -> Size -- ^ ignored, but retained for backwards compatibility
   -> Seed
   -> Property
   -> m (Report Result)
-checkRegion region color name size prop =
+checkRegion region color name _ seed prop =
   liftIO $ do
     result <-
-      checkReport (propertyConfig prop) size (propertyTest prop) $ \progress -> do
+      checkReport (propertyConfig prop) undefined seed (propertyTest prop) $ \progress -> do
         ppprogress <- renderProgress color name progress
         case reportStatus progress of
           Running ->
@@ -467,7 +469,7 @@ checkNamed ::
   -> m (Report Result)
 checkNamed region color name mseed prop = do
   seed <- resolveSeed mseed
-  checkRegion region color name seed prop
+  checkRegion region color name undefined seed prop
 
 -- | Check a property.
 --
@@ -484,7 +486,7 @@ recheckAt seed skip prop0 = do
   color <- detectColor
   let prop = withSkip skip prop0
   _ <- liftIO . displayRegion $ \region ->
-    checkRegion region color Nothing seed prop
+    checkRegion region color Nothing undefined seed prop
   pure ()
 
 -- | Check a group of properties using the specified runner config.
