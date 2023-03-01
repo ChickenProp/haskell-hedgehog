@@ -21,6 +21,7 @@ checkProp :: MonadIO m => Property -> m (Report Result)
 checkProp prop = do
   seed <- Config.resolveSeed Nothing
   liftIO $ Runner.checkReport (Property.propertyConfig prop)
+                              undefined
                               seed
                               (Property.propertyTest prop)
                               (const $ pure ())
