@@ -26,24 +26,27 @@ import           Hedgehog.Internal.Report (Report(..), Result(..), FailureReport
 -- | We use this property to help test skipping. It keeps a log of every time it
 --   runs in the 'IORef' it's passed.
 --
---   It ignores its seed. It discards at size 1 and fails at size 2. When it
---   shrinks, it initially shrinks to something that will pass, and then to
---   something that will fail.
+--   It ignores its seed. The second test discards (and continues to discard
+--   until the size grows) and the third fails. When it shrinks, it initially
+--   shrinks to something that will pass, and then to something that will fail.
 --
 skipTestProperty :: IORef [(Size, Int, Bool, Bool)] -> Property
 skipTestProperty logRef =
   withTests 5 . property $ do
-    val@(curSize, _, shouldDiscard, shouldPass) <- forAll $ do
+    val@(testNum, _, shouldDiscard, shouldPass) <- forAll $ do
+      -- With 5 tests, size goes 0, 24, 48, 72, 97.
+      -- When we also discard at 24, it goes 0, (24 x 10), 25, 49, 73, 97.
       curSize <- Gen.sized pure
+      let testNum = curSize `div` 24
       (shouldDiscard, shouldPass, nShrinks) <-
         (,,)
-          <$> pure (curSize == 1)
-          <*> Gen.shrink (\b -> if b then [] else [True]) (pure $ curSize /= 2)
+          <$> pure (curSize == 24)
+          <*> Gen.shrink (\b -> if b then [] else [True]) (pure $ testNum /= 2)
           <*> Gen.shrink (\n -> reverse [0 .. n-1]) (pure 3)
-      pure (curSize, nShrinks, shouldDiscard, shouldPass)
+      pure (testNum, nShrinks, shouldDiscard, shouldPass)
 
     -- Fail coverage to make sure we disable it when shrinking.
-    cover 100 "Not 4" (curSize /= 4)
+    cover 100 "Not 4" (testNum /= 4)
 
     liftIO $ IORef.modifyIORef' logRef (val :)
     when shouldDiscard discard
@@ -54,7 +57,7 @@ checkProp prop = do
   seed <- Config.resolveSeed Nothing
   liftIO $ Runner.checkReport
     (Property.propertyConfig prop)
-    0
+    undefined
     seed
     (Property.propertyTest prop)
     (const $ pure ())
@@ -79,17 +82,20 @@ prop_SkipNothing =
 
     logs <- liftIO $ reverse <$> IORef.readIORef logRef
     logs ===
-      [ (0, 3, False, True)
-      , (1, 3, True, True)
-      , (2, 3, False, False)
-      , (2, 3, False, True)
-      , (2, 2, False, False)
-      , (2, 2, False, True)
-      , (2, 1, False, False)
-      , (2, 1, False, True)
-      , (2, 0, False, False)
-      , (2, 0, False, True)
-      ]
+      concat
+        [ [ (0, 3, False, True) ]
+        , replicate 10 (1, 3, True, True)
+        , [ (1, 3, False, True)
+          , (2, 3, False, False)
+          , (2, 3, False, True)
+          , (2, 2, False, False)
+          , (2, 2, False, True)
+          , (2, 1, False, False)
+          , (2, 1, False, True)
+          , (2, 0, False, False)
+          , (2, 0, False, True)
+          ]
+        ]
 
 prop_SkipToFailingTest :: Property
 prop_SkipToFailingTest =
@@ -105,7 +111,8 @@ prop_SkipToFailingTest =
         failureShrinks f === 3
         failureShrinkPath f === ShrinkPath [1, 1, 1]
 
-      _ ->
+      _ -> do
+        annotateShow report
         failure
 
     logs <- liftIO $ reverse <$> IORef.readIORef logRef
@@ -148,7 +155,8 @@ prop_SkipToNoShrink =
         failureShrinks f === 0
         failureShrinkPath f === Property.ShrinkPath []
 
-      _ ->
+      _ -> do
+        annotateShow report
         failure
 
     logs <- liftIO $ reverse <$> IORef.readIORef logRef
@@ -168,7 +176,8 @@ prop_SkipToFailingShrink =
         failureShrinks f === 2
         failureShrinkPath f === Property.ShrinkPath [1, 1]
 
-      _ ->
+      _ -> do
+        annotateShow report
         failure
 
     logs <- liftIO $ reverse <$> IORef.readIORef logRef
@@ -215,10 +224,10 @@ prop_SkipToReportedShrink =
 
     failure1 === failure2
 
-    reportTests report1 === 2
-    reportTests report2 === 2
-    reportDiscards report1 === 1
-    reportDiscards report2 === 1
+    reportTests report1 === 3
+    reportTests report2 === 3
+    reportDiscards report1 === 10
+    reportDiscards report2 === 10
 
 genSkip :: Gen Skip
 genSkip =
